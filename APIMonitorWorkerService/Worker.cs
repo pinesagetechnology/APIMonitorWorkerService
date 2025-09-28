@@ -20,7 +20,7 @@ namespace APIMonitorWorkerService
 
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         {
-            _logger.LogInformation("Worker started at: {time}", DateTimeOffset.Now);
+            _logger.LogInformation("🚀 APIMonitorWorkerService started at: {time}", DateTimeOffset.Now);
 
             int intervalSeconds = 5;
             using (var scope = _serviceProvider.CreateScope())
@@ -38,48 +38,61 @@ namespace APIMonitorWorkerService
                 datasourceList = await dataSourceService.GetAllDataSourcesAsync();
             }
 
+            _logger.LogInformation("🚀 Found {Count} datasources to process", datasourceList.Count());
+
             foreach (var datasource in datasourceList)
             {
                 IServiceScope? scope = null;
                 try
                 {
-                    _logger.LogInformation($"Starting to monitor API: {datasource.Name}");
+                    _logger.LogInformation("🔧 Setting up ApiPoller for datasource: {Name} (Enabled: {Enabled}, Endpoint: {Endpoint})", 
+                        datasource.Name, datasource.IsEnabled, datasource.ApiEndpoint);
+                    
                     scope = _serviceProvider.CreateScope();
                     var poller = scope.ServiceProvider.GetRequiredService<IApiPoller>();
                     
                     if(datasource.IsEnabled == false)
                     {
-                        _logger.LogInformation($"Datasource {datasource.Name} is disabled. Skipping...");
+                        _logger.LogInformation("⏸️ Datasource {Name} is disabled. Skipping...", datasource.Name);
                         continue;
                     }
 
+                    _logger.LogInformation("▶️ Starting ApiPoller for {Name} with polling interval: {Interval} minutes", 
+                        datasource.Name, datasource.PollingIntervalMinutes);
+
                     await poller.StartAsync(datasource, async (id, error) =>
                     {
-                        _logger.LogError("Watcher error for datasource {Id}: {Error}", id, error);
+                        _logger.LogError("💥 Watcher error for datasource {Id}: {Error}", id, error);
                         await Task.CompletedTask;
                     });
 
                     _activePollers.TryAdd(datasource.Name, (scope, poller));
                     scope = null; // Don't dispose if successfully added
+                    
+                    _logger.LogInformation("✅ Successfully added ApiPoller for {Name} to active pollers. Total active: {Count}", 
+                        datasource.Name, _activePollers.Count);
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, $"Failed to start poller for {datasource.Name}");
+                    _logger.LogError(ex, "❌ Failed to start poller for {Name}: {Message}", datasource.Name, ex.Message);
                     scope?.Dispose(); // Clean up scope if poller creation failed
                     continue;
                 }
             }
+            
+            _logger.LogInformation("🎯 Initialization complete. Total active ApiPollers: {Count}", _activePollers.Count);
 
             while (!stoppingToken.IsCancellationRequested)
             {
                 if (_logger.IsEnabled(LogLevel.Information))
                 {
-                    _logger.LogInformation("Worker running at: {time}", DateTimeOffset.Now);
+                    _logger.LogInformation("🔄 Worker running at: {time} with {Count} active ApiPollers", 
+                        DateTimeOffset.Now, _activePollers.Count);
                 }
 
                 await RefreshWatchersAsync();
 
-                await Task.Delay(intervalSeconds, stoppingToken);
+                await Task.Delay(intervalSeconds * 1000, stoppingToken);
             }
         }
 
@@ -225,7 +238,7 @@ namespace APIMonitorWorkerService
             }
         }
 
-        public void Dispose()
+        public override void Dispose()
         {
             if (!_disposed)
             {

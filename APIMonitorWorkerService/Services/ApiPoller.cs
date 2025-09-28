@@ -17,7 +17,7 @@ namespace APIMonitorWorkerService.Services
     {
         private readonly IServiceProvider _serviceProvider;
         private readonly ILogger<ApiPoller> _logger;
-        private readonly HttpClient _httpClient;
+        private readonly IHttpClientFactory _httpClientFactory;
         private readonly IRepository<APIDataSourceConfig> _repository;
 
         private Timer? _pollingTimer;
@@ -25,16 +25,17 @@ namespace APIMonitorWorkerService.Services
         private readonly SemaphoreSlim _semaphore = new(1, 1);
         private DateTime _lastPollTime = DateTime.MinValue;
         private bool _disposed = false;
+        private APIDataSourceConfig? _currentConfig;
 
         public bool IsRunning => _isRunning;
 
         public ApiPoller(
-            HttpClient httpClient,
+            IHttpClientFactory httpClientFactory,
             IServiceProvider serviceProvider,
             IConfigurationService configurationService,
             IRepository<APIDataSourceConfig> repository)
         {
-            _httpClient = httpClient;
+            _httpClientFactory = httpClientFactory;
             _serviceProvider = serviceProvider;
             _repository = repository;
             _logger = serviceProvider.GetRequiredService<ILogger<ApiPoller>>();
@@ -44,27 +45,45 @@ namespace APIMonitorWorkerService.Services
         {
             if (_disposed) throw new ObjectDisposedException(nameof(ApiPoller));
             
-            ConfigureHttpClient(config);
-
-            if (_isRunning) return;
+            if (_isRunning) 
+            {
+                _logger.LogDebug("ApiPoller for {Name} is already running, skipping start", config.Name);
+                return;
+            }
 
             await _semaphore.WaitAsync();
             try
             {
-                if (_isRunning) return;
+                if (_isRunning) 
+                {
+                    _logger.LogDebug("ApiPoller for {Name} is already running (double-check), skipping start", config.Name);
+                    return;
+                }
 
                 if(config.IsEnabled)
                 {
                     if (string.IsNullOrEmpty(config.ApiEndpoint))
                     {
                         var error = "API endpoint is not configured";
+                        _logger.LogError("Cannot start ApiPoller for {Name}: {Error}", config.Name, error);
                         await _onError(config.Id, error);
                         throw new InvalidOperationException(error);
                     }
                     
+                    _currentConfig = config; // Store config for use in timer callback
                     var interval = TimeSpan.FromMinutes(config.PollingIntervalMinutes);
-                    _pollingTimer = new Timer(async _ => await PollApiAsync(config), null, TimeSpan.Zero, interval);
+                    
+                    _logger.LogInformation("Starting ApiPoller for {Name} with interval {Interval} minutes, endpoint: {Endpoint}", 
+                        config.Name, config.PollingIntervalMinutes, config.ApiEndpoint);
+                    
+                    _pollingTimer = new Timer(async _ => await PollApiAsync(), null, TimeSpan.Zero, interval);
                     _isRunning = true;
+                    
+                    _logger.LogInformation("✅ ApiPoller timer started successfully for {Name} - first poll will happen immediately", config.Name);
+                }
+                else
+                {
+                    _logger.LogInformation("ApiPoller for {Name} is disabled, skipping start", config.Name);
                 }
             }
             finally
@@ -75,17 +94,28 @@ namespace APIMonitorWorkerService.Services
 
         public async Task StopAsync()
         {
-            if (_disposed || !_isRunning) return;
+            if (_disposed || !_isRunning) 
+            {
+                _logger.LogDebug("ApiPoller for {Name} is not running or already disposed, skipping stop", _currentConfig?.Name ?? "Unknown");
+                return;
+            }
+
+            _logger.LogInformation("Stopping ApiPoller for {Name}", _currentConfig?.Name ?? "Unknown");
 
             await _semaphore.WaitAsync();
             try
             {
-                if (!_isRunning) return;
+                if (!_isRunning) 
+                {
+                    _logger.LogDebug("ApiPoller for {Name} is not running (double-check), skipping stop", _currentConfig?.Name ?? "Unknown");
+                    return;
+                }
 
                 _pollingTimer?.Dispose();
                 _pollingTimer = null;
                 _isRunning = false;
 
+                _logger.LogInformation("✅ ApiPoller stopped successfully for {Name}", _currentConfig?.Name ?? "Unknown");
             }
             finally
             {
@@ -93,19 +123,21 @@ namespace APIMonitorWorkerService.Services
             }
         }
 
-        private void ConfigureHttpClient(APIDataSourceConfig config)
+        private HttpClient CreateConfiguredHttpClient(APIDataSourceConfig config)
         {
+            var httpClient = _httpClientFactory.CreateClient();
+            
             using var scope = _serviceProvider.CreateScope();
             var configService = scope.ServiceProvider.GetRequiredService<IConfigurationService>();
 
             // Set timeout
             var timeoutSeconds = configService.GetValueAsync<int?>("Api.TimeoutSeconds").Result ?? 30;
-            _httpClient.Timeout = TimeSpan.FromSeconds(timeoutSeconds);
+            httpClient.Timeout = TimeSpan.FromSeconds(timeoutSeconds);
 
             // Add API key if configured
             if (!string.IsNullOrEmpty(config.ApiKey))
             {
-                _httpClient.DefaultRequestHeaders.Add("X-API-Key", config.ApiKey);
+                httpClient.DefaultRequestHeaders.Add("X-API-Key", config.ApiKey);
             }
 
             // Add custom headers from additional settings
@@ -118,7 +150,7 @@ namespace APIMonitorWorkerService.Services
                     {
                         foreach (var header in settings.Headers)
                         {
-                            _httpClient.DefaultRequestHeaders.Add(header.Key, header.Value);
+                            httpClient.DefaultRequestHeaders.Add(header.Key, header.Value);
                         }
                     }
                 }
@@ -129,114 +161,103 @@ namespace APIMonitorWorkerService.Services
             }
 
             // Set user agent
-            _httpClient.DefaultRequestHeaders.Add("User-Agent", "AzureGateway/1.0");
+            httpClient.DefaultRequestHeaders.Add("User-Agent", "AzureGateway/1.0");
+            
+            return httpClient;
         }
 
-        private async Task PollApiAsync(APIDataSourceConfig config)
+        private async Task PollApiAsync()
         {
-            if (!_isRunning) return;
+            var configName = _currentConfig?.Name ?? "Unknown";
+            
+            _logger.LogInformation("🔄 Timer callback triggered for {Name} at {Time}", configName, DateTime.UtcNow);
+            
+            // Check if the instance has been disposed
+            if (_disposed || !_isRunning || _currentConfig == null) 
+            {
+                _logger.LogWarning("⚠️ PollApiAsync called but ApiPoller is disposed/stopped/null for {Name}", configName);
+                // If disposed, stop the timer
+                if (_disposed && _pollingTimer != null)
+                {
+                    _logger.LogInformation("Stopping timer for disposed ApiPoller {Name}", configName);
+                    _pollingTimer.Dispose();
+                    _pollingTimer = null;
+                }
+                return;
+            }
 
+            _logger.LogInformation("📡 Starting API call for {Name} to {Endpoint}", configName, _currentConfig.ApiEndpoint);
+
+            HttpClient? httpClient = null;
             try
             {
-                var response = await _httpClient.GetAsync(config.ApiEndpoint);
+                // Create a fresh HttpClient for each request to avoid disposal issues
+                httpClient = CreateConfiguredHttpClient(_currentConfig);
+                _logger.LogDebug("Created HttpClient for {Name}", configName);
+                
+                var startTime = DateTime.UtcNow;
+                var response = await httpClient.GetAsync(_currentConfig.ApiEndpoint);
+                var responseTime = DateTime.UtcNow - startTime;
+                
+                _logger.LogInformation("📊 API response received for {Name} - Status: {StatusCode}, ResponseTime: {ResponseTime}ms", 
+                    configName, response.StatusCode, responseTime.TotalMilliseconds);
+                
                 response.EnsureSuccessStatusCode();
 
                 var content = await response.Content.ReadAsStringAsync();
                 var contentType = response.Content.Headers.ContentType?.MediaType?.ToLower();
+                var contentLength = content.Length;
 
-                await ProcessApiResponseAsync(config.Name, content, contentType);
+                _logger.LogInformation("📄 API response content for {Name} - ContentType: {ContentType}, Length: {Length} characters", 
+                    configName, contentType, contentLength);
+
+                await ProcessApiResponseAsync(configName, content, contentType);
 
                 _lastPollTime = DateTime.UtcNow;
 
-                if (config != null)
-                {
-                    config.LastProcessedAt = _lastPollTime;
-
-                    await _repository.UpdateAsync(config);
-                }
+                // Update the last processed time
+                _currentConfig.LastProcessedAt = _lastPollTime;
+                await _repository.UpdateAsync(_currentConfig);
+                
+                _logger.LogInformation("✅ Successfully processed API response for {Name}, next poll in {Interval} minutes", 
+                    configName, _currentConfig.PollingIntervalMinutes);
             }
             catch (HttpRequestException ex)
             {
-                throw new HttpRequestException($"Error fetching API data: {ex.Message}", ex);
+                _logger.LogError(ex, "❌ HTTP error fetching API data for {Name}: {Message}", configName, ex.Message);
             }
             catch (TaskCanceledException ex) when (ex.CancellationToken.IsCancellationRequested)
             {
-                throw new TaskCanceledException("API polling was canceled", ex);
+                _logger.LogWarning(ex, "⏹️ API polling was canceled for {Name}", configName);
+            }
+            catch (ObjectDisposedException ex)
+            {
+                _logger.LogWarning(ex, "🗑️ ApiPoller was disposed during polling for {Name}", configName);
+                // Stop the timer since we're disposed
+                _pollingTimer?.Dispose();
+                _pollingTimer = null;
+                return;
             }
             catch (Exception ex)
             {
-                throw new Exception($"Unexpected error during API polling: {ex.Message}", ex);
+                _logger.LogError(ex, "💥 Unexpected error during API polling for {Name}: {Message}", configName, ex.Message);
+            }
+            finally
+            {
+                // Dispose the HttpClient to prevent connection leaks
+                httpClient?.Dispose();
+                _logger.LogDebug("Disposed HttpClient for {Name}", configName);
             }
         }
 
         private async Task ProcessApiResponseAsync(string configName, string content, string? contentType)
         {
-            // Determine how to process based on content type and response structure
-            if (IsJsonContent(contentType))
-            {
-                await ProcessJsonResponseAsync(configName, content);
-            }
-            else
-            {
-                // Handle other content types or treat as raw data
-                await ProcessRawResponseAsync(configName, content, contentType ?? "text/plain");
-            }
+            if (_disposed) return; // Don't process if disposed
+            
+            // Save the response as-is in a single file
+            await ProcessRawResponseAsync(configName, content, contentType ?? "application/json");
         }
 
-        private async Task ProcessJsonResponseAsync(string configName, string jsonContent)
-        {
-            using var document = JsonDocument.Parse(jsonContent);
-            var root = document.RootElement;
-
-            // Check if response contains an array of items or single item
-            if (root.ValueKind == JsonValueKind.Array)
-            {
-                await ProcessJsonArrayAsync(configName, root);
-            }
-            else if (root.ValueKind == JsonValueKind.Object)
-            {
-                // Check if object contains a data array
-                if (root.TryGetProperty("data", out var dataElement) && dataElement.ValueKind == JsonValueKind.Array)
-                {
-                    await ProcessJsonArrayAsync(configName, dataElement);
-                }
-                else if (root.TryGetProperty("items", out var itemsElement) && itemsElement.ValueKind == JsonValueKind.Array)
-                {
-                    await ProcessJsonArrayAsync(configName, itemsElement);
-                }
-                else
-                {
-                    // Process single object
-                    await ProcessSingleJsonItemAsync(configName, root);
-                }
-            }
-        }
-
-        private async Task ProcessJsonArrayAsync(string configName, JsonElement arrayElement)
-        {
-            var itemCount = 0;
-            foreach (var item in arrayElement.EnumerateArray())
-            {
-                await ProcessSingleJsonItemAsync(configName, item);
-                itemCount++;
-            }
-        }
-
-        private async Task ProcessSingleJsonItemAsync(string configName, JsonElement item)
-        {
-            // Generate a unique filename for this JSON item
-            var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss_fff");
-            var itemId = ExtractItemId(item) ?? Guid.NewGuid().ToString("N")[..8];
-            var fileName = $"api_data_{configName}_{timestamp}_{itemId}.json";
-
-            // Serialize the item back to JSON
-            var jsonString = JsonSerializer.Serialize(item, new JsonSerializerOptions
-            {
-                WriteIndented = true
-            });
-
-            await ProcessDataAsync(jsonString, fileName, FileType.Json);
-        }
 
         private async Task ProcessRawResponseAsync(string configName, string content, string contentType)
         {
@@ -244,36 +265,22 @@ namespace APIMonitorWorkerService.Services
             var extension = GetFileExtensionFromContentType(contentType);
             var fileName = $"api_response_{configName}_{timestamp}.{extension}";
             var fileType = FileHelper.GetFileType(fileName);
+            
+            _logger.LogInformation("💾 Saving API response to file: {FileName} (ContentType: {ContentType}, Length: {Length} chars)", 
+                fileName, contentType, content.Length);
+            
             await ProcessDataAsync(content, fileName, fileType);
         }
 
         private async Task ProcessDataAsync(string content, string fileName, FileType fileType)
         {
-            var tempDir = await GetTempDirectoryAsync();
+            if (_disposed || _currentConfig == null) return; // Don't process if disposed
+
+            var tempDir = GetTempDirectoryAsync(_currentConfig.TempFolderPath);
+
             var tempFilePath = Path.Combine(tempDir, fileName);
 
             await File.WriteAllTextAsync(tempFilePath, content, Encoding.UTF8);
-        }
-
-        private string? ExtractItemId(JsonElement item)
-        {
-            // Try common ID field names
-            var idFields = new[] { "id", "Id", "ID", "identifier", "key", "uuid" };
-
-            foreach (var field in idFields)
-            {
-                if (item.TryGetProperty(field, out var idElement))
-                {
-                    return idElement.ValueKind switch
-                    {
-                        JsonValueKind.String => idElement.GetString(),
-                        JsonValueKind.Number => idElement.GetInt64().ToString(),
-                        _ => null
-                    };
-                }
-            }
-
-            return null;
         }
 
         private static string GetFileExtensionFromContentType(string contentType)
@@ -290,18 +297,9 @@ namespace APIMonitorWorkerService.Services
             };
         }
 
-        private static bool IsJsonContent(string? contentType)
+        private string GetTempDirectoryAsync(string tempFolderPath)
         {
-            return contentType?.Contains("application/json") == true ||
-                   contentType?.Contains("text/json") == true;
-        }
-
-        private async Task<string> GetTempDirectoryAsync()
-        {
-            using var scope = _serviceProvider.CreateScope();
-            var configService = scope.ServiceProvider.GetRequiredService<IConfigurationService>();
-
-            var tempPath = await configService.GetValueAsync("Api.TempDirectory") ??
+            var tempPath = tempFolderPath ??
                            Path.Combine(Path.GetTempPath(), "azure-gateway", "api-data");
 
             if (!Directory.Exists(tempPath))
