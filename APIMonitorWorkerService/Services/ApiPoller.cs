@@ -253,9 +253,6 @@ namespace APIMonitorWorkerService.Services
             var tempFilePath = Path.Combine(tempDir, fileName);
 
             await File.WriteAllTextAsync(tempFilePath, content, Encoding.UTF8);
-
-            var hash = await FileHelper.CalculateFileHashAsync(tempFilePath);
-            var fileSize = new FileInfo(tempFilePath).Length;
         }
 
         private string? ExtractItemId(JsonElement item)
