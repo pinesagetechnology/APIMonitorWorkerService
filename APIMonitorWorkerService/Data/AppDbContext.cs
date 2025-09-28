@@ -12,5 +12,7 @@ namespace APIMonitorWorkerService.Data
         public DbSet<APIDataSourceConfig> APIDataSourceConfigs { get; set; }
 
         public DbSet<Configuration> Configurations { get; set; }
+
+        public DbSet<APIMonitorServiceHeartBeat> APIMonitorServiceHeartBeats { get; set; }
     }
 }

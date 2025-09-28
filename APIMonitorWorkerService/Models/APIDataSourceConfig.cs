@@ -24,7 +24,7 @@ namespace APIMonitorWorkerService.Models
         [StringLength(200)]
         public string? ApiKey { get; set; }
 
-        public int PollingIntervalMinutes { get; set; } = 5;
+        public int PollingIntervalMinutes { get; set; } = 1;
 
         public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
 

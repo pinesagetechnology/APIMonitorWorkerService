@@ -92,6 +92,8 @@ namespace APIMonitorWorkerService
 
                 await RefreshWatchersAsync();
 
+                await HeartBeatUpdate();
+
                 await Task.Delay(intervalSeconds * 1000, stoppingToken);
             }
         }
@@ -235,6 +237,15 @@ namespace APIMonitorWorkerService
                         }
                     }
                 }
+            }
+        }
+
+        private async Task HeartBeatUpdate()
+        {
+            using (var scope = _serviceProvider.CreateScope())
+            {
+                var heartbeatService = scope.ServiceProvider.GetRequiredService<IHeartbeatService>();
+                await heartbeatService.Upsert();
             }
         }
 

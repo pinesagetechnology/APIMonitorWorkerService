@@ -42,58 +42,39 @@ namespace APIMonitorWorkerService.Data
                 await context.Database.EnsureCreatedAsync();
                 logger.LogInformation("Database schema ensured successfully");
 
+                // Ensure all required tables exist
+                var allTablesExist = await EnsureAllTablesExistAsync(context, logger);
+                if (!allTablesExist)
+                {
+                    logger.LogError("Failed to ensure all required tables exist. Database initialization is incomplete.");
+                    logger.LogError("Application may not function correctly without all required tables.");
+                    return;
+                }
+
                 var tableNames = await GetTableNamesAsync(context);
                 logger.LogInformation("Database contains {Count} tables: {Tables}",
                     tableNames.Count, string.Join(", ", tableNames));
 
                 logger.LogInformation("Checking for APIDataSourceConfig table and existing data...");
                 
-                // Verify that the APIDataSourceConfig table exists after EnsureCreated
-                var tableExists = await CheckIfTableExistsAsync(context, "APIDataSourceConfigs");
-                if (!tableExists)
+                try
                 {
-                    logger.LogError("APIDataSourceConfigs table was not created by EnsureCreated. This indicates a configuration issue.");
-                    logger.LogError("Available tables: {Tables}", string.Join(", ", tableNames));
-                    
-                    // Try to create the table manually as a last resort
-                    try
+                    var existingConfigs = await context.APIDataSourceConfigs.CountAsync();
+                    logger.LogInformation("Found {Count} existing data source configurations", existingConfigs);
+
+                    if (!await context.APIDataSourceConfigs.AnyAsync())
                     {
-                        logger.LogInformation("Attempting to create APIDataSourceConfig table manually...");
-                        await CreateAPIDataSourceConfigTableManually(context, logger);
-                        tableExists = await CheckIfTableExistsAsync(context, "APIDataSourceConfigs");
+                        logger.LogInformation("No data source configurations found, seeding defaults...");
+                        await SeedDataSourcesIfEmptyAsync(context, logger);
                     }
-                    catch (Exception ex)
+                    else
                     {
-                        logger.LogError(ex, "Failed to create APIDataSourceConfig table manually");
+                        logger.LogInformation("Data source configurations already exist, skipping seeding");
                     }
                 }
-
-                if (tableExists)
+                catch (Exception ex)
                 {
-                    try
-                    {
-                        var existingConfigs = await context.APIDataSourceConfigs.CountAsync();
-                        logger.LogInformation("Found {Count} existing data source configurations", existingConfigs);
-
-                        if (!await context.APIDataSourceConfigs.AnyAsync())
-                        {
-                            logger.LogInformation("No data source configurations found, seeding defaults...");
-                            await SeedDataSourcesIfEmptyAsync(context, logger);
-                        }
-                        else
-                        {
-                            logger.LogInformation("Data source configurations already exist, skipping seeding");
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        logger.LogError(ex, "Error accessing APIDataSourceConfig table");
-                    }
-                }
-                else
-                {
-                    logger.LogError("Failed to create or locate APIDataSourceConfigs table. Database initialization is incomplete.");
-                    logger.LogError("Application may not function correctly without this table.");
+                    logger.LogError(ex, "Error accessing APIDataSourceConfig table");
                 }
 
                 logger.LogInformation("Seeding essential configuration values...");
@@ -158,6 +139,81 @@ namespace APIMonitorWorkerService.Data
             }
         }
 
+        /// <summary>
+        /// Ensures all required tables exist in the database. Creates them if they don't exist.
+        /// </summary>
+        /// <param name="context">Database context</param>
+        /// <param name="logger">Logger instance</param>
+        /// <returns>True if all tables exist or were created successfully</returns>
+        public static async Task<bool> EnsureAllTablesExistAsync(AppDbContext context, ILogger logger)
+        {
+            try
+            {
+                logger.LogInformation("Checking if all required tables exist...");
+                
+                var requiredTables = new[]
+                {
+                    "APIDataSourceConfigs",
+                    "Configurations", 
+                    "APIMonitorServiceHeartBeats"
+                };
+
+                var missingTables = new List<string>();
+                
+                foreach (var tableName in requiredTables)
+                {
+                    var exists = await CheckIfTableExistsAsync(context, tableName);
+                    if (!exists)
+                    {
+                        missingTables.Add(tableName);
+                        logger.LogWarning("Table '{TableName}' does not exist", tableName);
+                    }
+                    else
+                    {
+                        logger.LogInformation("Table '{TableName}' exists", tableName);
+                    }
+                }
+
+                if (missingTables.Count == 0)
+                {
+                    logger.LogInformation("All required tables exist");
+                    return true;
+                }
+
+                logger.LogInformation("Creating {Count} missing tables: {Tables}", 
+                    missingTables.Count, string.Join(", ", missingTables));
+
+                using var connection = context.Database.GetDbConnection();
+                await connection.OpenAsync();
+
+                foreach (var tableName in missingTables)
+                {
+                    try
+                    {
+                        var createTableSql = GetCreateTableSql(tableName);
+                        var command = connection.CreateCommand();
+                        command.CommandText = createTableSql;
+                        await command.ExecuteNonQueryAsync();
+                        
+                        logger.LogInformation("Successfully created table '{TableName}'", tableName);
+                    }
+                    catch (Exception ex)
+                    {
+                        logger.LogError(ex, "Failed to create table '{TableName}'", tableName);
+                        return false;
+                    }
+                }
+
+                logger.LogInformation("All required tables have been created successfully");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "Error ensuring all tables exist");
+                return false;
+            }
+        }
+
         private static async Task CreateAPIDataSourceConfigTableManually(AppDbContext context, ILogger logger)
         {
             try
@@ -165,20 +221,7 @@ namespace APIMonitorWorkerService.Data
                 using var connection = context.Database.GetDbConnection();
                 await connection.OpenAsync();
 
-                var createTableSql = @"
-                    CREATE TABLE IF NOT EXISTS APIDataSourceConfigs (
-                        Id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        Name TEXT NOT NULL,
-                        IsEnabled INTEGER NOT NULL DEFAULT 1,
-                        IsRefreshing INTEGER NOT NULL DEFAULT 1,
-                        TempFolderPath TEXT,
-                        ApiEndpoint TEXT,
-                        ApiKey TEXT,
-                        PollingIntervalMinutes INTEGER NOT NULL DEFAULT 5,
-                        CreatedAt TEXT NOT NULL,
-                        LastProcessedAt TEXT,
-                        AdditionalSettings TEXT
-                    )";
+                var createTableSql = GetCreateTableSql("APIDataSourceConfigs");
 
                 var command = connection.CreateCommand();
                 command.CommandText = createTableSql;
@@ -191,6 +234,47 @@ namespace APIMonitorWorkerService.Data
                 logger.LogError(ex, "Failed to create APIDataSourceConfig table manually");
                 throw;
             }
+        }
+
+        /// <summary>
+        /// Gets the SQL CREATE TABLE statement for the specified table name
+        /// </summary>
+        /// <param name="tableName">Name of the table</param>
+        /// <returns>SQL CREATE TABLE statement</returns>
+        private static string GetCreateTableSql(string tableName)
+        {
+            return tableName switch
+            {
+                "APIDataSourceConfigs" => @"
+                    CREATE TABLE IF NOT EXISTS APIDataSourceConfigs (
+                        Id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        Name TEXT NOT NULL,
+                        IsEnabled INTEGER NOT NULL DEFAULT 1,
+                        IsRefreshing INTEGER NOT NULL DEFAULT 1,
+                        TempFolderPath TEXT,
+                        ApiEndpoint TEXT,
+                        ApiKey TEXT,
+                        PollingIntervalMinutes INTEGER NOT NULL DEFAULT 5,
+                        CreatedAt TEXT NOT NULL,
+                        LastProcessedAt TEXT,
+                        AdditionalSettings TEXT
+                    )",
+                "Configurations" => @"
+                    CREATE TABLE IF NOT EXISTS Configurations (
+                        Key TEXT PRIMARY KEY,
+                        Value TEXT NOT NULL,
+                        Description TEXT,
+                        UpdatedAt TEXT NOT NULL,
+                        Category TEXT,
+                        IsEncrypted INTEGER NOT NULL DEFAULT 0
+                    )",
+                "APIMonitorServiceHeartBeats" => @"
+                    CREATE TABLE IF NOT EXISTS APIMonitorServiceHeartBeats (
+                        Id INTEGER PRIMARY KEY,
+                        LastRun TEXT
+                    )",
+                _ => throw new ArgumentException($"Unknown table name: {tableName}")
+            };
         }
 
         private static async Task SeedDataSourcesIfEmptyAsync(AppDbContext context, ILogger logger)
@@ -219,7 +303,7 @@ namespace APIMonitorWorkerService.Data
                         ApiKey="",
                         AdditionalSettings="",
                         LastProcessedAt = null,
-                        PollingIntervalMinutes = 5,
+                        PollingIntervalMinutes = 1,
                         CreatedAt = DateTime.UtcNow
                     }
                 };

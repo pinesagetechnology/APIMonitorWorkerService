@@ -7,7 +7,9 @@
             services.AddScoped<IConfigurationService, ConfigurationService>();
             services.AddScoped<IDataSourceService, DataSourceService>();
             services.AddScoped<IApiPoller, ApiPoller>();
+            services.AddScoped<IHeartbeatService, HeartBeatService>();
             services.AddHttpClient(); // Add HttpClient factory for proper lifecycle management
+
             return services;
         }
     }
