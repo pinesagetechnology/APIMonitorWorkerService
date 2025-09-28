@@ -46,18 +46,54 @@ namespace APIMonitorWorkerService.Data
                 logger.LogInformation("Database contains {Count} tables: {Tables}",
                     tableNames.Count, string.Join(", ", tableNames));
 
-                logger.LogInformation("Checking for existing data source configurations...");
-                var existingConfigs = await context.APIDataSourceConfigs.CountAsync();
-                logger.LogInformation("Found {Count} existing data source configurations", existingConfigs);
-
-                if (!await context.APIDataSourceConfigs.AnyAsync())
+                logger.LogInformation("Checking for APIDataSourceConfig table and existing data...");
+                
+                // Verify that the APIDataSourceConfig table exists after EnsureCreated
+                var tableExists = await CheckIfTableExistsAsync(context, "APIDataSourceConfigs");
+                if (!tableExists)
                 {
-                    logger.LogInformation("No data source configurations found, seeding defaults...");
-                    await SeedDataSourcesIfEmptyAsync(context, logger);
+                    logger.LogError("APIDataSourceConfigs table was not created by EnsureCreated. This indicates a configuration issue.");
+                    logger.LogError("Available tables: {Tables}", string.Join(", ", tableNames));
+                    
+                    // Try to create the table manually as a last resort
+                    try
+                    {
+                        logger.LogInformation("Attempting to create APIDataSourceConfig table manually...");
+                        await CreateAPIDataSourceConfigTableManually(context, logger);
+                        tableExists = await CheckIfTableExistsAsync(context, "APIDataSourceConfigs");
+                    }
+                    catch (Exception ex)
+                    {
+                        logger.LogError(ex, "Failed to create APIDataSourceConfig table manually");
+                    }
+                }
+
+                if (tableExists)
+                {
+                    try
+                    {
+                        var existingConfigs = await context.APIDataSourceConfigs.CountAsync();
+                        logger.LogInformation("Found {Count} existing data source configurations", existingConfigs);
+
+                        if (!await context.APIDataSourceConfigs.AnyAsync())
+                        {
+                            logger.LogInformation("No data source configurations found, seeding defaults...");
+                            await SeedDataSourcesIfEmptyAsync(context, logger);
+                        }
+                        else
+                        {
+                            logger.LogInformation("Data source configurations already exist, skipping seeding");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        logger.LogError(ex, "Error accessing APIDataSourceConfig table");
+                    }
                 }
                 else
                 {
-                    logger.LogInformation("Data source configurations already exist, skipping seeding");
+                    logger.LogError("Failed to create or locate APIDataSourceConfigs table. Database initialization is incomplete.");
+                    logger.LogError("Application may not function correctly without this table.");
                 }
 
                 logger.LogInformation("Seeding essential configuration values...");
@@ -94,6 +130,66 @@ namespace APIMonitorWorkerService.Data
             catch
             {
                 return new List<string>();
+            }
+        }
+
+        private static async Task<bool> CheckIfTableExistsAsync(AppDbContext context, string tableName)
+        {
+            try
+            {
+                using var connection = context.Database.GetDbConnection();
+                await connection.OpenAsync();
+
+                var command = connection.CreateCommand();
+                command.CommandText = "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=@tableName";
+                
+                var parameter = command.CreateParameter();
+                parameter.ParameterName = "@tableName";
+                parameter.Value = tableName;
+                command.Parameters.Add(parameter);
+
+                var result = await command.ExecuteScalarAsync();
+                return Convert.ToInt32(result) > 0;
+            }
+            catch (Exception ex)
+            {
+                // Log the exception but don't throw - this is a helper method
+                return false;
+            }
+        }
+
+        private static async Task CreateAPIDataSourceConfigTableManually(AppDbContext context, ILogger logger)
+        {
+            try
+            {
+                using var connection = context.Database.GetDbConnection();
+                await connection.OpenAsync();
+
+                var createTableSql = @"
+                    CREATE TABLE IF NOT EXISTS APIDataSourceConfigs (
+                        Id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        Name TEXT NOT NULL,
+                        IsEnabled INTEGER NOT NULL DEFAULT 1,
+                        IsRefreshing INTEGER NOT NULL DEFAULT 1,
+                        TempFolderPath TEXT,
+                        ApiEndpoint TEXT,
+                        ApiKey TEXT,
+                        PollingIntervalMinutes INTEGER NOT NULL DEFAULT 5,
+                        CreatedAt TEXT NOT NULL,
+                        LastProcessedAt TEXT,
+                        AdditionalSettings TEXT
+                    )";
+
+                var command = connection.CreateCommand();
+                command.CommandText = createTableSql;
+                await command.ExecuteNonQueryAsync();
+
+                logger.LogInformation("APIDataSourceConfig table created manually");
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "Failed to create APIDataSourceConfig table manually");
+                throw;
             }
         }
 

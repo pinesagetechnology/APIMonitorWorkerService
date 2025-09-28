@@ -47,6 +47,12 @@ namespace APIMonitorWorkerService
                     scope = _serviceProvider.CreateScope();
                     var poller = scope.ServiceProvider.GetRequiredService<IApiPoller>();
                     
+                    if(datasource.IsEnabled == false)
+                    {
+                        _logger.LogInformation($"Datasource {datasource.Name} is disabled. Skipping...");
+                        continue;
+                    }
+
                     await poller.StartAsync(datasource, async (id, error) =>
                     {
                         _logger.LogError("Watcher error for datasource {Id}: {Error}", id, error);
@@ -60,6 +66,7 @@ namespace APIMonitorWorkerService
                 {
                     _logger.LogError(ex, $"Failed to start poller for {datasource.Name}");
                     scope?.Dispose(); // Clean up scope if poller creation failed
+                    continue;
                 }
             }
 
@@ -70,7 +77,9 @@ namespace APIMonitorWorkerService
                     _logger.LogInformation("Worker running at: {time}", DateTimeOffset.Now);
                 }
 
-                await Task.Delay(1000, stoppingToken);
+                await RefreshWatchersAsync();
+
+                await Task.Delay(intervalSeconds, stoppingToken);
             }
         }
 
@@ -108,6 +117,112 @@ namespace APIMonitorWorkerService
             _activePollers.Clear();
 
             await base.StopAsync(cancellationToken);
+        }
+
+        private async Task RefreshWatchersAsync()
+        {
+            IEnumerable<APIDataSourceConfig> datasourceList;
+
+            using (var scope = _serviceProvider.CreateScope())
+            {
+                var dataSourceService = scope.ServiceProvider.GetRequiredService<IDataSourceService>();
+                datasourceList = await dataSourceService.GetAllDataSourcesAsync();
+            }
+
+            foreach (var datasource in datasourceList)
+            {
+                var itemToRefresh = _activePollers.FirstOrDefault(x => x.Key == datasource.Name);
+
+                // Handle existing poller
+                if (!string.IsNullOrEmpty(itemToRefresh.Key))
+                {
+                    if (datasource.IsRefreshing || datasource.IsEnabled == false)
+                    {
+                        _logger.LogInformation($"Stopping existing poller for datasource: {datasource.Name}");
+                        try
+                        {
+                            await itemToRefresh.Value.Poller.StopAsync();
+                        }
+                        finally
+                        {
+                            itemToRefresh.Value.Scope.Dispose();
+                        }
+                        _activePollers.TryRemove(itemToRefresh.Key, out var _);
+                    }
+                    
+                    // If datasource is disabled, don't restart it
+                    if (datasource.IsEnabled == false)
+                    {
+                        continue;
+                    }
+
+                    if (datasource.IsRefreshing && datasource.IsEnabled)
+                    {
+                        _logger.LogInformation($"Refreshing API Poller: {datasource.ApiEndpoint} for datasource: {datasource.Name}");
+
+                        IServiceScope? scope = null;
+                        try
+                        {
+                            _logger.LogInformation($"Restarting to monitor API: {datasource.Name}");
+
+                            scope = _serviceProvider.CreateScope();
+                            var poller = scope.ServiceProvider.GetRequiredService<IApiPoller>();
+
+                            await poller.StartAsync(datasource, async (id, error) =>
+                            {
+                                _logger.LogError("Watcher error for datasource {Id}: {Error}", id, error);
+                                await Task.CompletedTask;
+                            });
+
+                            // Reset the refreshing flag for all data sources
+                            datasource.IsRefreshing = false;
+                            using (var updateScope = _serviceProvider.CreateScope())
+                            {
+                                var dataSourceService = updateScope.ServiceProvider.GetRequiredService<IDataSourceService>();
+                                await dataSourceService.UpdateDataSourcesIsrefreshingFlagAsync(datasource);
+                            }
+
+                            _activePollers.TryAdd(datasource.Name, (scope, poller));
+                            scope = null; // Don't dispose if successfully added
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogError(ex, $"Failed to start poller for {datasource.Name}");
+                            scope?.Dispose(); // Clean up scope if poller creation failed
+                            continue;
+                        }
+                    }
+                }
+                else
+                {
+                    // Handle new datasource (not currently running)
+                    if (datasource.IsEnabled == true)
+                    {
+                        _logger.LogInformation($"Starting new poller for datasource: {datasource.Name}");
+                        
+                        IServiceScope? scope = null;
+                        try
+                        {
+                            scope = _serviceProvider.CreateScope();
+                            var poller = scope.ServiceProvider.GetRequiredService<IApiPoller>();
+
+                            await poller.StartAsync(datasource, async (id, error) =>
+                            {
+                                _logger.LogError("Watcher error for datasource {Id}: {Error}", id, error);
+                                await Task.CompletedTask;
+                            });
+
+                            _activePollers.TryAdd(datasource.Name, (scope, poller));
+                            scope = null; // Don't dispose if successfully added
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogError(ex, $"Failed to start new poller for {datasource.Name}");
+                            scope?.Dispose(); // Clean up scope if poller creation failed
+                        }
+                    }
+                }
+            }
         }
 
         public void Dispose()

@@ -53,16 +53,19 @@ namespace APIMonitorWorkerService.Services
             {
                 if (_isRunning) return;
 
-                if (string.IsNullOrEmpty(config.ApiEndpoint))
+                if(config.IsEnabled)
                 {
-                    var error = "API endpoint is not configured";
-                    await _onError(config.Id, error);
-                    throw new InvalidOperationException(error);
+                    if (string.IsNullOrEmpty(config.ApiEndpoint))
+                    {
+                        var error = "API endpoint is not configured";
+                        await _onError(config.Id, error);
+                        throw new InvalidOperationException(error);
+                    }
+                    
+                    var interval = TimeSpan.FromMinutes(config.PollingIntervalMinutes);
+                    _pollingTimer = new Timer(async _ => await PollApiAsync(config), null, TimeSpan.Zero, interval);
+                    _isRunning = true;
                 }
-
-                var interval = TimeSpan.FromMinutes(config.PollingIntervalMinutes);
-                _pollingTimer = new Timer(async _ => await PollApiAsync(config), null, TimeSpan.Zero, interval);
-                _isRunning = true;
             }
             finally
             {
