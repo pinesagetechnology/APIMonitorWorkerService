@@ -10,6 +10,7 @@ INSTALL_PATH="/opt/apimonitor"
 DATA_PATH=""
 SERVICE_NAME="apimonitor"
 SERVICE_USER="apimonitor"
+SHARED_GROUP="monitor-services"
 SKIP_DOTNET=false
 VERBOSE=false
 INTERACTIVE=true
@@ -280,6 +281,19 @@ install_dotnet8() {
     fi
 }
 
+# Function to setup shared group for cross-service database access
+setup_shared_group() {
+    log_step "Setting up shared group for cross-service database access..."
+    
+    # Create shared group if it doesn't exist
+    if ! getent group "$SHARED_GROUP" &>/dev/null; then
+        groupadd "$SHARED_GROUP"
+        log_info "Created shared group: $SHARED_GROUP"
+    else
+        log_info "Shared group $SHARED_GROUP already exists"
+    fi
+}
+
 # Function to create system user
 create_service_user() {
     log_step "Creating service user..."
@@ -290,6 +304,10 @@ create_service_user() {
     else
         log_info "User $SERVICE_USER already exists"
     fi
+    
+    # Add user to shared group for cross-service database access
+    usermod -a -G "$SHARED_GROUP" "$SERVICE_USER"
+    log_info "Added $SERVICE_USER to $SHARED_GROUP group"
 }
 
 # Function to create directory structure
@@ -312,18 +330,24 @@ create_directories() {
         verbose_log "Created directory: $dir"
     done
     
-    # Set ownership
-    chown -R "$SERVICE_USER:$SERVICE_USER" "$INSTALL_PATH"
-    chown -R "$SERVICE_USER:$SERVICE_USER" "$DATA_PATH"
+    # Set ownership with shared group
+    chown -R "$SERVICE_USER:$SHARED_GROUP" "$INSTALL_PATH"
+    chown -R "$SERVICE_USER:$SHARED_GROUP" "$DATA_PATH"
     
-    # Set permissions
+    # Set permissions - database directory needs group write for SQLite WAL/SHM files
     chmod 755 "$INSTALL_PATH"
     chmod 755 "$DATA_PATH"
-    chmod 755 "$DATA_PATH/database"
+    chmod 775 "$DATA_PATH/database"  # Group write for shared access
     chmod 755 "$DATA_PATH/logs"
     chmod 755 "$DATA_PATH/config"
     chmod 755 "$DATA_PATH/temp"
     chmod 755 "$DATA_PATH/api-responses"
+    
+    # Set permissions on existing database files
+    if ls "$DATA_PATH/database/"*.db 1> /dev/null 2>&1; then
+        chmod 664 "$DATA_PATH/database/"*.db
+        log_info "Updated permissions on existing database files"
+    fi
     
     log_info "Directory structure created with proper permissions"
 }
@@ -508,7 +532,8 @@ main() {
         fi
     fi
 
-    # Create user and directories
+    # Setup shared group and create user and directories
+    setup_shared_group
     create_service_user
     create_directories
 
